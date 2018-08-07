@@ -23,6 +23,13 @@ resource "consulacl_token" "token" {
   rule { scope="service"  policy="read"  prefix=""             }
 }
 
+resource "consulacl_token" "second" {
+	name = "Second"
+	type = "client"
+
+	rule { scope="key" policy="read" prefix="second" }
+}
+
 resource "consulacl_token" "inherited" {
 	name  = "Inherited token"
 	type  = "client"
@@ -31,7 +38,9 @@ resource "consulacl_token" "inherited" {
 	rule { scope="key"	policy="write" prefix="foo/bar"      }
 	rule { scope="key"  policy="read"  prefix="foo/bar/baz"  }
 
-	inherits = [ "${consulacl_token.token.name}" ]
+	inherits = [  "${consulacl_token.token.rule}",
+						  	"${consulacl_token.second.rule}" 
+							]
 }
 `
 

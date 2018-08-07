@@ -2,8 +2,8 @@ package consulacl
 
 import (
 	"crypto/sha256"
-	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"sort"
 	"strings"
@@ -42,6 +42,7 @@ func resourceConsulACLToken() *schema.Resource {
 		Update: resourceConsulACLTokenUpdate,
 		Read:   resourceConsulACLTokenRead,
 		Delete: resourceConsulACLTokenDelete,
+		Exists: resourceConsulACLTokenExists,
 
 		Importer: &schema.ResourceImporter{
 			State: func(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
@@ -107,7 +108,7 @@ func resourceConsulACLToken() *schema.Resource {
 			FieldInherits: &schema.Schema{
 				Type:     schema.TypeList,
 				Optional: true,
-				Elem:     &schema.Schema{Type: schema.TypeString},
+				Elem:     &schema.Schema{Type: schema.TypeMap},
 			},
 		},
 	}
@@ -121,54 +122,16 @@ func resourceConsulACLTokenCreate(d *schema.ResourceData, meta interface{}) erro
 		return err
 	}
 
-	// We have to get a list of all the ACLs currently in Consul
-	// Since we don't know the token string for exising acls,
-	// we need to parse them out, so we can reference by name
-	// We can also use this to enforce unique names
-	allACLs, _, err := client.ACL().List(nil)
-
-	if err != nil {
-		return err
-	}
-
-	for _, acls := range allACLs {
-
-		if acls.Name == d.Get(FieldName).(string) {
-			// Don't have duplicate token names
-			return errors.New("There is already a token with this name")
-		}
-
-	}
-
 	var inheritedRules string
 
 	if len(d.Get("inherits").([]interface{})) > 0 {
-
-		inherits := reflect.ValueOf(d.Get("inherits"))
-		for i := 0; i < inherits.Len(); i++ {
-			inheritString := inherits.Index(i).Interface().(string)
-
-			var aclToken string
-
-			for _, acls := range allACLs {
-
-				if acls.Name == inheritString {
-					aclToken = acls.ID
-					break
-				}
-
-			}
-
-			acl, _, errClient := client.ACL().Info(aclToken, nil)
-
-			if errClient != nil {
-				return errClient
-			}
-
-			inheritedRules = inheritedRules + "\n" + acl.Rules
-		}
+		inherits := d.Get("inherits").([]interface{})
+		existingRules, _ := extractRules(inherits)
+		inheritedRules = inheritedRules + encodeRules(existingRules)
 		rules, _ = dedupeRules(encodeRules(rules), inheritedRules)
 	}
+
+	d.Set(FieldRule, rules)
 
 	var acl *consul.ACLEntry
 
@@ -191,11 +154,6 @@ func resourceConsulACLTokenCreate(d *schema.ResourceData, meta interface{}) erro
 
 func resourceConsulACLTokenRead(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
-
-	/*_, err := extractRules(d.Get(FieldRule).(*schema.Set).List())
-	if err != nil {
-		return err
-	}*/
 
 	acl, _, err := client.ACL().Info(d.Get(FieldToken).(string), nil)
 	if err != nil {
@@ -221,6 +179,23 @@ func resourceConsulACLTokenRead(d *schema.ResourceData, meta interface{}) error 
 	return nil
 }
 
+func resourceConsulACLTokenExists(d *schema.ResourceData, meta interface{}) (bool, error) {
+	client := meta.(*consul.Client)
+
+	_, resp, err := client.ACL().Info(d.Get(FieldToken).(string), nil)
+	if err != nil {
+		if resp != nil {
+			log.Printf("[WARN] Token %s not found", d.Get(FieldName).(string))
+			d.SetId("")
+			return false, nil
+		}
+		return false, fmt.Errorf("Error retrieving ACL %s", d.Get(FieldName).(string))
+	}
+
+	return true, nil
+
+}
+
 func resourceConsulACLTokenUpdate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
 
@@ -230,83 +205,16 @@ func resourceConsulACLTokenUpdate(d *schema.ResourceData, meta interface{}) erro
 	}
 
 	if len(d.Get("inherits").([]interface{})) > 0 {
-		if d.HasChange("rule") {
-			o, n := d.GetChange("rule")
-			if o == nil {
-				o = new(schema.Set)
-			}
-			if n == nil {
-				n = new(schema.Set)
-			}
-
-			os := o.(*schema.Set)
-			ns := n.(*schema.Set)
-
-			remove := os.Difference(ns).List()
-			add := ns.Difference(os).List()
-
-			a, _ := extractRules(add)
-			r, _ := extractRules(remove)
-
-			combinedRules := sortString(encodeRules(a) + "\n" + encodeRules(r))
-
-			rules, _ = decodeRules(combinedRules)
-			if err != nil {
-				return err
-			}
-
-			d.Set(FieldRule, rules)
-		}
-
 		var inheritedRules string
 
-		inherits := reflect.ValueOf(d.Get("inherits"))
-		for i := 0; i < inherits.Len(); i++ {
-			inheritString := inherits.Index(i).Interface().(string)
+		inherits := d.Get("inherits").([]interface{})
+		existingRules, _ := extractRules(inherits)
 
-			var aclToken string
-
-			// We have to get a list of all the ACLs currently in Consul
-			// Since we don't know the token string for exising acls,
-			// we need to parse them out, so we can reference by name
-			allACLs, _, err := client.ACL().List(nil)
-
-			if err != nil {
-				return err
-			}
-
-			for _, acls := range allACLs {
-
-				if acls.Name == d.Get(FieldName).(string) && d.Get(FieldToken).(string) == "" {
-					d.SetId(getSHA256(acls.ID))
-					d.Set(FieldToken, acls.ID)
-					break
-				}
-
-			}
-
-			for _, acls := range allACLs {
-
-				if acls.Name == inheritString {
-					aclToken = acls.ID
-					break
-				}
-
-			}
-
-			acl, _, errClient := client.ACL().Info(aclToken, nil)
-
-			if errClient != nil {
-				return errClient
-			}
-
-			inheritedRules = inheritedRules + "\n" + acl.Rules
-		}
-
-
-		r := encodeRules(rules)
-		rules, _ = dedupeRules(r, inheritedRules)
+		inheritedRules = inheritedRules + encodeRules(existingRules)
+		rules, _ = dedupeRules(encodeRules(rules), inheritedRules)
 	}
+
+	d.Set(FieldRule, rules)
 
 	acl := &consul.ACLEntry{
 		ID:    d.Get(FieldToken).(string),
@@ -389,6 +297,10 @@ func decodeRules(raw string) ([]map[string]string, error) {
 func dedupeRules(existingRules string, newRules string) ([]map[string]string, error) {
 	var allErrors *multierror.Error
 	var result []map[string]string
+
+	// ACL rules most permissive to least
+	permissions := []string{"write", "read", "deny"}
+
 	newRules = sortString(existingRules + newRules)
 	allRules, err := decodeRules(newRules)
 
@@ -408,25 +320,24 @@ func dedupeRules(existingRules string, newRules string) ([]map[string]string, er
 					jprefix, jok := j["prefix"]
 					if iok && jok {
 						if iprefix == jprefix {
-							if i["policy"] == j["policy"] {
-								found = true
-							} else if i["policy"] == "read" && j["policy"] == "write" {
-								found = true
-							} else if (i["policy"] == "read" && j["policy"] == "deny") ||
-								(i["policy"] == "write" && j["policy"] == "read") ||
-								(i["policy"] == "write" && j["policy"] == "deny") {
+							iPermissions := indexInSlice(i["policy"], permissions)
+							jPermissions := indexInSlice(j["policy"], permissions)
+
+							// The lower the index, the more permissive
+							// -1 if it's not found (it should never be -1)
+							if jPermissions > -1 && iPermissions < jPermissions {
 								result[jIndex] = i
 								found = true
 							}
 						}
 					}
 				} else if stringInSlice(i["scope"], singletonScopes) {
-					if i["scope"] == j["scope"] {
-						found = true
-					} else if (i["scope"] == "read" && j["scope"] == "deny") ||
-						(i["scope"] == "write" && j["scope"] == "read") ||
-						(i["scope"] == "write" && j["scope"] == "deny") {
+					iPermissions := indexInSlice(i["policy"], permissions)
+					jPermissions := indexInSlice(j["policy"], permissions)
+
+					if jPermissions > -1 && iPermissions < jPermissions {
 						result[jIndex] = i
+						found = true
 					}
 				}
 			}
@@ -498,6 +409,15 @@ func extractRules(rawRules []interface{}) ([]map[string]string, error) {
 	return result, allErrors.ErrorOrNil()
 }
 
+func indexInSlice(str string, list []string) int {
+	for index, key := range list {
+		if key == str {
+			return index
+		}
+	}
+	return -1
+}
+
 func stringInSlice(str string, list []string) bool {
 	for _, elem := range list {
 		if elem == str {
@@ -530,7 +450,7 @@ func sortString(w string) string {
 	sort.Strings(s)
 	var n []string
 	for _, str := range s {
-		if str != "" {
+		if str != "" && stringInSlice(str, n) == false {
 			n = append(n, str)
 		}
 	}
