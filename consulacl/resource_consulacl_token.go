@@ -2,40 +2,46 @@ package consulacl
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+
 	consul "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/helper/validation"
-	"reflect"
-	"sort"
-	"strings"
 )
 
-const FieldName = "name"
-const FieldToken = "token"
-const FieldType = "type"
+const (
+	FieldName  = "name"
+	FieldToken = "token"
+	FieldType  = "type"
 
-const FieldRule = "rule"
+	FieldRule = "rule"
 
-const FieldScope = "scope"
-const FieldPrefix = "prefix"
-const FieldPolicy = "policy"
+	FieldScope  = "scope"
+	FieldPrefix = "prefix"
+	FieldPolicy = "policy"
+
+	FieldInherits = "inherits"
+)
 
 var prefixedScopes = []string{"agent", "event", "key", "node", "query", "service", "session"}
 var singletonScopes = []string{"keyring", "operator"}
 
-func resourceConsulAclToken() *schema.Resource {
+func resourceConsulACLToken() *schema.Resource {
 	var allScopes []string
 	allScopes = append(allScopes, prefixedScopes...)
 	allScopes = append(allScopes, singletonScopes...)
 
 	return &schema.Resource{
-		Create: resourceConsulAclTokenCreate,
-		Update: resourceConsulAclTokenUpdate,
-		Read:   resourceConsulAclTokenRead,
-		Delete: resourceConsulAclTokenDelete,
+		Create: resourceConsulACLTokenCreate,
+		Update: resourceConsulACLTokenUpdate,
+		Read:   resourceConsulACLTokenRead,
+		Delete: resourceConsulACLTokenDelete,
 
 		Importer: &schema.ResourceImporter{
 			State: func(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
@@ -56,6 +62,7 @@ func resourceConsulAclToken() *schema.Resource {
 			FieldRule: {
 				Type:     schema.TypeSet,
 				Optional: true,
+				Computed: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						FieldScope: {
@@ -63,11 +70,13 @@ func resourceConsulAclToken() *schema.Resource {
 							// it's required but we have to enforce otherwise due to a bug in terraform
 							// when injecting rules as
 							// rule = ["${data.null_data_source.policy.*.outputs}"]
+							Computed:     true,
 							Optional:     true,
 							ValidateFunc: validation.StringInSlice(allScopes, true),
 						},
 						FieldPrefix: {
 							Type:     schema.TypeString,
+							Computed: true,
 							Optional: true,
 						},
 						FieldPolicy: {
@@ -75,6 +84,7 @@ func resourceConsulAclToken() *schema.Resource {
 							// it's required but we have to enforce otherwise due to a bug in terraform
 							// when injecting rules as
 							// rule = ["${data.null_data_source.policy.*.outputs}"]
+							Computed: true,
 							Optional: true,
 						},
 					},
@@ -83,9 +93,9 @@ func resourceConsulAclToken() *schema.Resource {
 
 			FieldToken: {
 				Type:      schema.TypeString,
+				Computed:  true,
 				Optional:  true,
 				Sensitive: true,
-				Computed:  true,
 			},
 
 			FieldType: {
@@ -93,11 +103,17 @@ func resourceConsulAclToken() *schema.Resource {
 				Required:     true,
 				ValidateFunc: validation.StringInSlice([]string{"client", "management"}, true),
 			},
+
+			FieldInherits: &schema.Schema{
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
 		},
 	}
 }
 
-func resourceConsulAclTokenCreate(d *schema.ResourceData, meta interface{}) error {
+func resourceConsulACLTokenCreate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
 
 	rules, err := extractRules(d.Get(FieldRule).(*schema.Set).List())
@@ -105,7 +121,58 @@ func resourceConsulAclTokenCreate(d *schema.ResourceData, meta interface{}) erro
 		return err
 	}
 
-	acl := &consul.ACLEntry{
+	// We have to get a list of all the ACLs currently in Consul
+	// Since we don't know the token string for exising acls,
+	// we need to parse them out, so we can reference by name
+	// We can also use this to enforce unique names
+	allACLs, _, err := client.ACL().List(nil)
+
+	if err != nil {
+		return err
+	}
+
+	for _, acls := range allACLs {
+
+		if acls.Name == d.Get(FieldName).(string) {
+			// Don't have duplicate token names
+			return errors.New("There is already a token with this name")
+		}
+
+	}
+
+	var inheritedRules string
+
+	if len(d.Get("inherits").([]interface{})) > 0 {
+
+		inherits := reflect.ValueOf(d.Get("inherits"))
+		for i := 0; i < inherits.Len(); i++ {
+			inheritString := inherits.Index(i).Interface().(string)
+
+			var aclToken string
+
+			for _, acls := range allACLs {
+
+				if acls.Name == inheritString {
+					aclToken = acls.ID
+					break
+				}
+
+			}
+
+			acl, _, errClient := client.ACL().Info(aclToken, nil)
+
+			if errClient != nil {
+				return errClient
+			}
+
+			inheritedRules = inheritedRules + "\n" + acl.Rules
+		}
+		rules, _ = dedupeRules(encodeRules(rules), inheritedRules)
+	}
+
+	var acl *consul.ACLEntry
+
+	acl = &consul.ACLEntry{
 		ID:    d.Get(FieldToken).(string),
 		Name:  d.Get(FieldName).(string),
 		Type:  d.Get(FieldType).(string),
@@ -119,16 +186,16 @@ func resourceConsulAclTokenCreate(d *schema.ResourceData, meta interface{}) erro
 
 	d.SetId(getSHA256(token))
 	d.Set(FieldToken, token)
-	return resourceConsulAclTokenRead(d, meta)
+	return resourceConsulACLTokenRead(d, meta)
 }
 
-func resourceConsulAclTokenRead(d *schema.ResourceData, meta interface{}) error {
+func resourceConsulACLTokenRead(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
 
-	_, err := extractRules(d.Get(FieldRule).(*schema.Set).List())
+	/*_, err := extractRules(d.Get(FieldRule).(*schema.Set).List())
 	if err != nil {
 		return err
-	}
+	}*/
 
 	acl, _, err := client.ACL().Info(d.Get(FieldToken).(string), nil)
 	if err != nil {
@@ -140,25 +207,105 @@ func resourceConsulAclTokenRead(d *schema.ResourceData, meta interface{}) error 
 		return nil
 	}
 
-	d.Set(FieldName, acl.Name)
-	d.Set(FieldType, acl.Type)
-
 	rules, err := decodeRules(acl.Rules)
 	if err != nil {
 		return err
 	}
 
+	d.SetId(getSHA256(acl.ID))
+	d.Set(FieldToken, acl.ID)
+	d.Set(FieldName, acl.Name)
+	d.Set(FieldType, acl.Type)
 	d.Set(FieldRule, rules)
 
 	return nil
 }
 
-func resourceConsulAclTokenUpdate(d *schema.ResourceData, meta interface{}) error {
+func resourceConsulACLTokenUpdate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
 
 	rules, err := extractRules(d.Get(FieldRule).(*schema.Set).List())
 	if err != nil {
 		return err
+	}
+
+	if len(d.Get("inherits").([]interface{})) > 0 {
+		if d.HasChange("rule") {
+			o, n := d.GetChange("rule")
+			if o == nil {
+				o = new(schema.Set)
+			}
+			if n == nil {
+				n = new(schema.Set)
+			}
+
+			os := o.(*schema.Set)
+			ns := n.(*schema.Set)
+
+			remove := os.Difference(ns).List()
+			add := ns.Difference(os).List()
+
+			a, _ := extractRules(add)
+			r, _ := extractRules(remove)
+
+			combinedRules := sortString(encodeRules(a) + "\n" + encodeRules(r))
+
+			rules, _ = decodeRules(combinedRules)
+			if err != nil {
+				return err
+			}
+
+			d.Set(FieldRule, rules)
+		}
+
+		var inheritedRules string
+
+		inherits := reflect.ValueOf(d.Get("inherits"))
+		for i := 0; i < inherits.Len(); i++ {
+			inheritString := inherits.Index(i).Interface().(string)
+
+			var aclToken string
+
+			// We have to get a list of all the ACLs currently in Consul
+			// Since we don't know the token string for exising acls,
+			// we need to parse them out, so we can reference by name
+			allACLs, _, err := client.ACL().List(nil)
+
+			if err != nil {
+				return err
+			}
+
+			for _, acls := range allACLs {
+
+				if acls.Name == d.Get(FieldName).(string) && d.Get(FieldToken).(string) == "" {
+					d.SetId(getSHA256(acls.ID))
+					d.Set(FieldToken, acls.ID)
+					break
+				}
+
+			}
+
+			for _, acls := range allACLs {
+
+				if acls.Name == inheritString {
+					aclToken = acls.ID
+					break
+				}
+
+			}
+
+			acl, _, errClient := client.ACL().Info(aclToken, nil)
+
+			if errClient != nil {
+				return errClient
+			}
+
+			inheritedRules = inheritedRules + "\n" + acl.Rules
+		}
+
+
+		r := encodeRules(rules)
+		rules, _ = dedupeRules(r, inheritedRules)
 	}
 
 	acl := &consul.ACLEntry{
@@ -173,10 +320,10 @@ func resourceConsulAclTokenUpdate(d *schema.ResourceData, meta interface{}) erro
 		return err
 	}
 
-	return resourceConsulAclTokenRead(d, meta)
+	return resourceConsulACLTokenRead(d, meta)
 }
 
-func resourceConsulAclTokenDelete(d *schema.ResourceData, meta interface{}) error {
+func resourceConsulACLTokenDelete(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*consul.Client)
 
 	_, err := client.ACL().Destroy(d.Get(FieldToken).(string), nil)
@@ -237,6 +384,59 @@ func decodeRules(raw string) ([]map[string]string, error) {
 	}
 
 	return result, nil
+}
+
+func dedupeRules(existingRules string, newRules string) ([]map[string]string, error) {
+	var allErrors *multierror.Error
+	var result []map[string]string
+	newRules = sortString(existingRules + newRules)
+	allRules, err := decodeRules(newRules)
+
+	if err != nil {
+		err := fmt.Errorf("Couldn't decode all the rules")
+		allErrors = multierror.Append(allErrors, err)
+	}
+
+	for _, i := range allRules {
+		found := false
+		for jIndex, j := range result {
+			// Search through the ones we've already added
+
+			if strings.ToLower(i["scope"]) == strings.ToLower(j["scope"]) {
+				if stringInSlice(i["scope"], prefixedScopes) {
+					iprefix, iok := i["prefix"]
+					jprefix, jok := j["prefix"]
+					if iok && jok {
+						if iprefix == jprefix {
+							if i["policy"] == j["policy"] {
+								found = true
+							} else if i["policy"] == "read" && j["policy"] == "write" {
+								found = true
+							} else if (i["policy"] == "read" && j["policy"] == "deny") ||
+								(i["policy"] == "write" && j["policy"] == "read") ||
+								(i["policy"] == "write" && j["policy"] == "deny") {
+								result[jIndex] = i
+								found = true
+							}
+						}
+					}
+				} else if stringInSlice(i["scope"], singletonScopes) {
+					if i["scope"] == j["scope"] {
+						found = true
+					} else if (i["scope"] == "read" && j["scope"] == "deny") ||
+						(i["scope"] == "write" && j["scope"] == "read") ||
+						(i["scope"] == "write" && j["scope"] == "deny") {
+						result[jIndex] = i
+					}
+				}
+			}
+		}
+		if found == false {
+			result = append(result, i)
+		}
+	}
+
+	return result, allErrors.ErrorOrNil()
 }
 
 // HCL lib does not provide Marshal/Serialize functionality :/
@@ -323,4 +523,16 @@ func getSHA256(src string) string {
 	h := sha256.New()
 	h.Write([]byte(src))
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func sortString(w string) string {
+	s := strings.Split(w, "\n")
+	sort.Strings(s)
+	var n []string
+	for _, str := range s {
+		if str != "" {
+			n = append(n, str)
+		}
+	}
+	return strings.Join(n, "\n")
 }
