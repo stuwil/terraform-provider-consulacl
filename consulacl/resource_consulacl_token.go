@@ -429,11 +429,29 @@ func stringInSlice(str string, list []string) bool {
 
 // We only need this to run manual validation on fields
 func diffResource(d *schema.ResourceDiff, m interface{}) error {
-	_, newRules := d.GetChange(FieldRule)
+	if d.HasChange(FieldRule) {
+		origField, newField := d.GetChange(FieldRule)
 
-	_, err := extractRules(newRules.(*schema.Set).List())
-	if err != nil {
-		return err
+		origRules, err := extractRules(origField.(*schema.Set).List())
+		if err != nil {
+			return err
+		}
+		_ = origRules
+
+		newRules, err := extractRules(newField.(*schema.Set).List())
+		if err != nil {
+			return err
+		}
+
+		if len(d.Get("inherits").([]interface{})) > 0 {
+			inherits := d.Get("inherits").([]interface{})
+			extractedInherits, _ := extractRules(inherits)
+			inheritedRules := encodeRules(extractedInherits)
+			combinedRules, _ := dedupeRules(encodeRules(newRules), inheritedRules)
+			if reflect.DeepEqual(encodeRules(origRules), encodeRules(combinedRules)) {
+				d.Clear(FieldRule)
+			}
+		}
 	}
 
 	return nil

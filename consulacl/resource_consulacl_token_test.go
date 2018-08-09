@@ -39,7 +39,7 @@ resource "consulacl_token" "inherited" {
 	rule { scope="key"  policy="read"  prefix="foo/bar/baz"  }
 
 	inherits = [  "${consulacl_token.token.rule}",
-						  	"${consulacl_token.second.rule}" 
+						  	"${consulacl_token.second.rule}"
 							]
 }
 `
@@ -75,8 +75,7 @@ func TestIntegrationToken(t *testing.T) {
 		),
 		Steps: []resource.TestStep{
 			{
-				Config:             aclTokenConfig,
-				ExpectNonEmptyPlan: true,
+				Config: aclTokenConfig,
 				Check: resource.ComposeTestCheckFunc(
 					checkTokenConfig("my-custom-token", "name", "A demo token"),
 					checkTokenConfig("my-custom-token", "type", "client"),
